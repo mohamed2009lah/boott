@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = [
+    "python311",
+    "tesseract",
+    "ffmpeg",
+    "wget"
+]
+
+[phases.install]
+cmds = [
+    "pip install --no-cache-dir python-telegram-bot[job-queue]==20.7",
+    "pip install --no-cache-dir aiohttp python-dotenv pytesseract Pillow yt-dlp gTTS"
+]
+
+[start]
+cmd = "python main.py"
