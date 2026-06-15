@@ -1,13 +1,22 @@
-import os, warnings, asyncio, logging
-from telegram.warnings import PTBUserWarning
-warnings.filterwarnings("ignore", category=PTBUserWarning)
-
+import os
+import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, ContextTypes, filters, PreCheckoutQueryHandler
-)
+
+# استيراد telegram مع معالجة الأخطاء
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+    from telegram.ext import (
+        Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+        ConversationHandler, ContextTypes, filters, PreCheckoutQueryHandler
+    )
+    from telegram.warnings import PTBUserWarning
+    import warnings
+    warnings.filterwarnings("ignore", category=PTBUserWarning)
+except ImportError as e:
+    print(f"❌ Error importing telegram: {e}")
+    print("Make sure python-telegram-bot is installed: pip install python-telegram-bot[job-queue]==20.7")
+    exit(1)
+
 from config import TOKEN, ADMIN_IDS, PAYMENT_PROVIDER_TOKEN
 from db import init, get_conn
 from api import shorten
@@ -25,6 +34,7 @@ from downloader import VideoDownloader
 from tts import TextToSpeech
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 ocr = OCRProcessor()
 downloader = VideoDownloader()
@@ -577,20 +587,8 @@ def main():
         app.job_queue.run_repeating(earnings_job, interval=1800, first=60)
 
     # تشغيل البوت
-    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
-    if WEBHOOK_URL:
-        if not WEBHOOK_URL.startswith("https://"):
-            print("⚠️ WEBHOOK_URL يجب أن يبدأ بـ https://")
-        else:
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=int(os.environ.get("PORT", 8443)),
-                url_path="webhook",
-                webhook_url=f"{WEBHOOK_URL}/webhook"
-            )
-    else:
-        print("✅ البوت يعمل (Polling)...")
-        app.run_polling()
+    print("✅ البوت يعمل...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
