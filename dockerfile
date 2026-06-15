@@ -1,4 +1,6 @@
 FROM python:3.11-slim
+
+# تثبيت الاعتماديات الأساسية
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-ara \
@@ -7,12 +9,25 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# تأكد من وجود ملفات اللغة العربية (إذا لم تكن موجودة)
-RUN if [ ! -f /usr/share/tesseract-ocr/5/tessdata/ara.traineddata ]; then \
-        wget -P /usr/share/tesseract-ocr/5/tessdata/ https://github.com/tesseract-ocr/tessdata/raw/main/ara.traineddata; \
-    fi
+# تحميل بيانات Tesseract للعربية
+RUN mkdir -p /usr/share/tesseract-ocr/4.00/tessdata/ && \
+    wget -O /usr/share/tesseract-ocr/4.00/tessdata/ara.traineddata \
+    https://github.com/tesseract-ocr/tessdata/raw/main/ara.traineddata
 
 WORKDIR /app
-COPY . .
+
+# نسخ الملفات أولاً
+COPY requirements.txt .
+
+# تثبيت المكتبات
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
+
+# نسخ باقي الملفات
+COPY . .
+
+# التحقق من التثبيت
+RUN python -c "from telegram import Bot; print('✅ python-telegram-bot installed successfully')"
+
+# تشغيل البوت
 CMD ["python", "main.py"]
