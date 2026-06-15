@@ -1,7 +1,7 @@
-python-telegram-bot==20.7
-aiohttp
-python-dotenv
-pytesseract
-Pillow
-yt-dlp
-gTTS
+python-telegram-bot[job-queue]==20.7
+aiohttp==3.9.5
+python-dotenv==1.0.1
+pytesseract==0.3.10
+Pillow==10.3.0
+yt-dlp==2024.5.27
+gTTS==2.5.3
