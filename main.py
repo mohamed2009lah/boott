@@ -1,22 +1,13 @@
-import os
-import logging
+import os, warnings, asyncio, logging
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
+
 from datetime import datetime
-
-# استيراد telegram مع معالجة الأخطاء
-try:
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-    from telegram.ext import (
-        Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-        ConversationHandler, ContextTypes, filters, PreCheckoutQueryHandler
-    )
-    from telegram.warnings import PTBUserWarning
-    import warnings
-    warnings.filterwarnings("ignore", category=PTBUserWarning)
-except ImportError as e:
-    print(f"❌ Error importing telegram: {e}")
-    print("Make sure python-telegram-bot is installed: pip install python-telegram-bot[job-queue]==20.7")
-    exit(1)
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters, PreCheckoutQueryHandler
+)
 from config import TOKEN, ADMIN_IDS, PAYMENT_PROVIDER_TOKEN
 from db import init, get_conn
 from api import shorten
@@ -34,14 +25,13 @@ from downloader import VideoDownloader
 from tts import TextToSpeech
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 ocr = OCRProcessor()
 downloader = VideoDownloader()
 tts = TextToSpeech()
 
 # حالات ConversationHandler
-WAIT_LINK, WAIT_BROADCAST, WAIT_SUPPORT, WAIT_OCR_PHOTO, WAIT_ORIGINAL = range(5)
+WAIT_LINK, WAIT_BROADCAST, WAIT_SUPPORT, WAIT_OCR_PHOTO, WAIT_TTS_TEXT = range(5)
 
 # قاموس لتخزين الفواتير المؤقتة للتحقق
 pending_invoices = {}
@@ -54,10 +44,8 @@ async def receive_link(update, context):
         await update.message.reply_text("❌ أرسل رابط صحيح يبدأ بـ http:// أو https://")
         return WAIT_LINK
     
-    # خصم النقاط بعد نجاح الاختصار
     short = await shorten(url)
     if short:
-        # خصم النقاط بعد النجاح
         if not middleware.spend_points_after_success(user_id, points_system.get_service_cost('shorten'), 'shorten'):
             await update.message.reply_text("❌ حدث خطأ في خصم النقاط")
             return ConversationHandler.END
@@ -97,13 +85,40 @@ async def receive_ocr_photo(update, context):
     wait = await update.message.reply_text("🔍 جارٍ استخراج النص...")
     text = await ocr.extract_from_photo(photo)
     if text:
-        # خصم النقاط بعد النجاح
         if middleware.spend_points_after_success(user_id, points_system.get_service_cost('ocr'), 'ocr'):
             await wait.edit_text(f"📝 {text}")
         else:
             await wait.edit_text("❌ حدث خطأ في خصم النقاط")
     else:
         await wait.edit_text("⚠️ لا يوجد نص")
+    return ConversationHandler.END
+
+async def receive_tts_text(update, context):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if len(text) > 500:
+        await update.message.reply_text("❌ النص أطول من 500 حرف")
+        return WAIT_TTS_TEXT
+    
+    ok, msg, skip, cost = await middleware.check_and_process(user_id, 'speak', context)
+    if not ok:
+        await update.message.reply_text(msg)
+        return ConversationHandler.END
+    if msg:
+        await update.message.reply_text(msg)
+    
+    wait = await update.message.reply_text("🎙️ جاري تحويل النص إلى صوت...")
+    path, err = await tts.convert(text)
+    if path:
+        if middleware.spend_points_after_success(user_id, cost, 'speak'):
+            with open(path, 'rb') as f:
+                await update.message.reply_voice(f)
+            os.remove(path)
+            await wait.delete()
+        else:
+            await wait.edit_text("❌ حدث خطأ في خصم النقاط")
+    else:
+        await wait.edit_text(f"❌ {err}")
     return ConversationHandler.END
 
 async def cancel(update, context):
@@ -187,7 +202,6 @@ async def pre_checkout_callback(update, context):
     user_id = query.from_user.id
     payload = query.invoice_payload
     
-    # التحقق من أن الفاتورة صادرة من البوت لهذا المستخدم
     if payload.startswith("points_") and pending_invoices.get(user_id) == payload:
         await query.answer(ok=True)
     else:
@@ -198,12 +212,95 @@ async def successful_payment_callback(update, context):
     payload = update.message.successful_payment.invoice_payload
     if payload.startswith("points_"):
         amount = int(payload.split("_")[1])
-        # إضافة النقاط بعد الدفع الناجح
         points_system.add_points(user_id, amount, 'stars_payment', f'شراء {amount} نقطة بنجاح')
-        # تنظيف الفاتورة المؤقتة
         if user_id in pending_invoices:
             del pending_invoices[user_id]
         await update.message.reply_text(f"✅ تم شراء {amount} نقطة بنجاح!")
+
+# ========== أوامر الخدمات (OCR, Download, TTS) ==========
+async def ocr_cmd(update, context):
+    await update.message.reply_text("📸 أرسل الصورة (يمكنك الرد على صورة موجودة)")
+    return WAIT_OCR_PHOTO
+
+async def dl_cmd(update, context):
+    uid = update.effective_user.id
+    ok, msg, skip, cost = await middleware.check_and_process(uid, 'download', context)
+    if not ok:
+        await update.message.reply_text(msg)
+        return
+    if msg:
+        await update.message.reply_text(msg)
+    if not context.args:
+        await update.message.reply_text("📥 /dl <رابط> أو /dl <جودة> <رابط>\nالجودة: best,720,480,360,audio")
+        return
+    
+    if len(context.args) == 1:
+        url = context.args[0]
+        quality = 'best'
+    else:
+        if context.args[0] in ['best', '720', '480', '360', 'audio']:
+            quality = context.args[0]
+            url = context.args[1]
+        else:
+            url = context.args[0]
+            quality = 'best'
+    
+    if not downloader.is_supported(url):
+        await update.message.reply_text("❌ الرابط غير مدعوم")
+        return
+    
+    wait = await update.message.reply_text("📥 جارٍ التحميل...")
+    info = await downloader.get_info(url)
+    if info:
+        await wait.edit_text(f"📹 {info['title']}\n⏳ تحميل...")
+    
+    path = await downloader.download(url, quality)
+    if path:
+        if middleware.spend_points_after_success(uid, cost, 'download'):
+            await wait.edit_text("📤 رفع...")
+            try:
+                with open(path, 'rb') as f:
+                    if quality == 'audio':
+                        await update.message.reply_audio(f, title=info['title'] if info else "Audio")
+                    else:
+                        await update.message.reply_video(f, caption=info['title'] if info else "فيديو")
+                os.remove(path)
+                await wait.delete()
+            except Exception as e:
+                await update.message.reply_text(f"❌ فشل الرفع: {e}")
+        else:
+            await wait.edit_text("❌ حدث خطأ في خصم النقاط")
+    else:
+        await wait.edit_text("❌ فشل التحميل")
+
+async def tts_cmd(update, context):
+    if context.args:
+        text = " ".join(context.args)
+        uid = update.effective_user.id
+        ok, msg, skip, cost = await middleware.check_and_process(uid, 'speak', context)
+        if not ok:
+            await update.message.reply_text(msg)
+            return
+        if msg:
+            await update.message.reply_text(msg)
+        if len(text) > 500:
+            await update.message.reply_text("❌ النص أطول من 500 حرف")
+            return
+        wait = await update.message.reply_text("🎙️ جاري تحويل النص إلى صوت...")
+        path, err = await tts.convert(text)
+        if path:
+            if middleware.spend_points_after_success(uid, cost, 'speak'):
+                with open(path, 'rb') as f:
+                    await update.message.reply_voice(f)
+                os.remove(path)
+                await wait.delete()
+            else:
+                await wait.edit_text("❌ حدث خطأ في خصم النقاط")
+        else:
+            await wait.edit_text(f"❌ {err}")
+    else:
+        await update.message.reply_text("🎙️ أرسل النص المراد تحويله إلى صوت:")
+        return WAIT_TTS_TEXT
 
 # ========== الأزرار (CallbackQuery) ==========
 async def button_handler(update, context):
@@ -212,7 +309,21 @@ async def button_handler(update, context):
     uid = q.from_user.id
     data = q.data
     
-    if data == "short":
+    # ====== أزرار المميزات الجديدة ======
+    if data == "dl":
+        await dl_cmd(update, context)
+        return
+    
+    elif data == "ocr":
+        await ocr_cmd(update, context)
+        return
+    
+    elif data == "tts":
+        await update.effective_message.reply_text("🎙️ أرسل النص المراد تحويله إلى صوت:")
+        return WAIT_TTS_TEXT
+    
+    # ====== الأزرار الأخرى ======
+    elif data == "short":
         ok, msg, skip, cost = await middleware.check_and_process(uid, 'shorten', context)
         if not ok:
             await q.message.reply_text(msg)
@@ -261,16 +372,11 @@ async def button_handler(update, context):
         if err:
             await q.message.reply_text(err)
             return
-        # إرسال إشعار للأدمن بدلاً من إضافة النقاط مباشرة
         for admin_id in ADMIN_IDS:
             try:
                 await context.bot.send_message(
                     admin_id,
-                    f"💰 طلب شراء نقاط\n"
-                    f"👤 المستخدم: {uid}\n"
-                    f"⭐ الكمية: {amt} نقطة\n"
-                    f"💵 السعر: {price:.2f}$\n"
-                    f"📝 للشراء: /grant {uid} {amt}"
+                    f"💰 طلب شراء نقاط\n👤 المستخدم: {uid}\n⭐ الكمية: {amt} نقطة\n💵 السعر: {price:.2f}$\n📝 للشراء: /grant {uid} {amt}"
                 )
             except:
                 pass
@@ -286,7 +392,6 @@ async def button_handler(update, context):
         if err:
             await q.message.reply_text(err)
             return
-        # تخزين الفاتورة المؤقتة
         payload = f"points_{amt}"
         pending_invoices[uid] = payload
         await context.bot.send_invoice(
@@ -325,7 +430,7 @@ async def button_handler(update, context):
     
     elif data == "admin_panel" and uid in ADMIN_IDS:
         await admin_panel.show_main_panel(q)
-        return ConversationHandler.END
+        return
     
     elif data == "withdraw":
         await q.message.reply_text("💳 /withdraw <المبلغ> <محفظة>")
@@ -383,86 +488,6 @@ async def button_handler(update, context):
     
     return ConversationHandler.END
 
-# ========== أوامر الخدمات (OCR, Download, TTS) ==========
-async def ocr_cmd(update, context):
-    await update.message.reply_text("📸 أرسل الصورة (يمكنك الرد على صورة موجودة)")
-    return WAIT_OCR_PHOTO
-
-async def dl_cmd(update, context):
-    uid = update.effective_user.id
-    ok, msg, skip, cost = await middleware.check_and_process(uid, 'download', context)
-    if not ok:
-        await update.message.reply_text(msg)
-        return
-    if msg:
-        await update.message.reply_text(msg)
-    if not context.args:
-        await update.message.reply_text("📥 /dl <رابط> أو /dl <جودة> <رابط>\nالجودة: best,720,480,360,audio")
-        return
-    
-    if len(context.args) == 1:
-        url = context.args[0]
-        quality = 'best'
-    else:
-        if context.args[0] in ['best', '720', '480', '360', 'audio']:
-            quality = context.args[0]
-            url = context.args[1]
-        else:
-            url = context.args[0]
-            quality = 'best'
-    
-    if not downloader.is_supported(url):
-        await update.message.reply_text("❌ الرابط غير مدعوم")
-        return
-    
-    wait = await update.message.reply_text("📥 جارٍ التحميل...")
-    info = await downloader.get_info(url)
-    if info:
-        await wait.edit_text(f"📹 {info['title']}\n⏳ تحميل...")
-    
-    path = await downloader.download(url, quality)
-    if path:
-        # خصم النقاط بعد النجاح
-        if middleware.spend_points_after_success(uid, cost, 'download'):
-            await wait.edit_text("📤 رفع...")
-            try:
-                with open(path, 'rb') as f:
-                    if quality == 'audio':
-                        await update.message.reply_audio(f, title=info['title'] if info else "Audio")
-                    else:
-                        await update.message.reply_video(f, caption=info['title'] if info else "فيديو")
-                os.remove(path)
-                await wait.delete()
-            except Exception as e:
-                await update.message.reply_text(f"❌ فشل الرفع: {e}")
-        else:
-            await wait.edit_text("❌ حدث خطأ في خصم النقاط")
-    else:
-        await wait.edit_text("❌ فشل التحميل")
-
-async def tts_cmd(update, context):
-    uid = update.effective_user.id
-    ok, msg, skip, cost = await middleware.check_and_process(uid, 'speak', context)
-    if not ok:
-        await update.message.reply_text(msg)
-        return
-    if msg:
-        await update.message.reply_text(msg)
-    if not context.args:
-        await update.message.reply_text("🎙️ /tts <نص>")
-        return
-    text = " ".join(context.args)
-    path, err = await tts.convert(text)
-    if path:
-        if middleware.spend_points_after_success(uid, cost, 'speak'):
-            with open(path, 'rb') as f:
-                await update.message.reply_voice(f)
-            os.remove(path)
-        else:
-            await update.message.reply_text("❌ حدث خطأ في خصم النقاط")
-    else:
-        await update.message.reply_text(f"❌ {err}")
-
 # ========== /start ==========
 async def start(update, context):
     u = update.effective_user
@@ -498,24 +523,35 @@ async def start(update, context):
         pts = points_system.get_balance(u.id)
         bot = (await context.bot.get_me()).username
         ref_link = f"https://t.me/{bot}?start={my_ref}"
-        msg = f"""👋 أهلاً بك
+        msg = f"""👋 أهلاً بك في **VAIMING**
+
 💰 الرصيد: {bal:.3f}$ | 💵 إجمالي الأرباح: {total:.3f}$
 ⭐ النقاط: {pts} | 🔗 الروابط: {links}
-👥 المدعوين: {refs} (✅{watched} ⏳{refs-watched})
-🔗 رابط الدعوة: {ref_link}"""
+👥 المدعوين: {refs} (✅{watched} شاهدوا)
+
+🔗 رابط الدعوة: `{ref_link}`
+
+📢 **استخدم الأزرار أدناه للوصول إلى جميع المميزات**"""
+
+        # ========== الأزرار الكاملة ==========
         kb = [
             [InlineKeyboardButton("🔗 اختصار رابط", callback_data="short")],
+            [InlineKeyboardButton("📥 تحميل فيديو", callback_data="dl"),
+             InlineKeyboardButton("📸 استخراج نص (OCR)", callback_data="ocr")],
+            [InlineKeyboardButton("🎙️ تحويل نص لصوت (TTS)", callback_data="tts")],
             [InlineKeyboardButton("💰 رصيدي", callback_data="bal"),
              InlineKeyboardButton("⭐ نقاطي", callback_data="points_info")],
-            [InlineKeyboardButton("📊 إحصائياتي", callback_data="stats")],
-            [InlineKeyboardButton("💳 سحب", callback_data="withdraw")],
-            [InlineKeyboardButton("🔗 الدعوة", callback_data="ref"),
-             InlineKeyboardButton("🛒 شراء نقاط", callback_data="buy_points_menu")],
-            [InlineKeyboardButton("🎁 يومية", callback_data="daily"),
-             InlineKeyboardButton("🆘 دعم", callback_data="support")],
+            [InlineKeyboardButton("📊 إحصائياتي", callback_data="stats"),
+             InlineKeyboardButton("💳 سحب", callback_data="withdraw")],
+            [InlineKeyboardButton("🛒 شراء نقاط", callback_data="buy_points_menu"),
+             InlineKeyboardButton("🎁 مكافأة يومية", callback_data="daily")],
+            [InlineKeyboardButton("🔗 رابط الدعوة", callback_data="ref"),
+             InlineKeyboardButton("🆘 دعم فني", callback_data="support")],
         ]
+        
         if u.id in ADMIN_IDS:
             kb.append([InlineKeyboardButton("🔐 لوحة الأدمن", callback_data="admin_panel")])
+            
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
 
 # ========== Job Queue ==========
@@ -555,6 +591,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    conv_tts = ConversationHandler(
+        entry_points=[CommandHandler("tts", tts_cmd), CallbackQueryHandler(button_handler, pattern="^tts$")],
+        states={WAIT_TTS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_tts_text)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
 
     # الأوامر
     app.add_handler(CommandHandler("start", start))
@@ -569,13 +611,13 @@ def main():
     app.add_handler(CommandHandler("add_ad", add_ad_cmd))
     app.add_handler(CommandHandler("remove_ad", remove_ad_cmd))
     app.add_handler(CommandHandler("dl", dl_cmd))
-    app.add_handler(CommandHandler("tts", tts_cmd))
 
     # ConversationHandlers
     app.add_handler(conv_short)
     app.add_handler(conv_broadcast)
     app.add_handler(conv_support)
     app.add_handler(conv_ocr)
+    app.add_handler(conv_tts)
 
     # باقي المعالجات
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -587,8 +629,20 @@ def main():
         app.job_queue.run_repeating(earnings_job, interval=1800, first=60)
 
     # تشغيل البوت
-    print("✅ البوت يعمل...")
-    app.run_polling()
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+    if WEBHOOK_URL:
+        if not WEBHOOK_URL.startswith("https://"):
+            print("⚠️ WEBHOOK_URL يجب أن يبدأ بـ https://")
+        else:
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=int(os.environ.get("PORT", 8443)),
+                url_path="webhook",
+                webhook_url=f"{WEBHOOK_URL}/webhook"
+            )
+    else:
+        print("✅ البوت يعمل (Polling)...")
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
