@@ -1,0 +1,12 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+
+[build.nixpacks]
+nixpacksVersion = "1.25.0"
+nixPkgs = ["python311", "tesseract", "ffmpeg"]
+
+[build.nixpacks.config]
+pythonVersion = "3.11"
