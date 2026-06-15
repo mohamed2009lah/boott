@@ -311,15 +311,15 @@ async def button_handler(update, context):
     
     # ====== أزرار المميزات الجديدة ======
     if data == "dl":
-        await dl_cmd(update, context)
+        await q.message.reply_text("📥 أرسل رابط الفيديو للتحميل:\nالصيغة: /dl <رابط> أو /dl <جودة> <رابط>\nالجودة: best,720,480,360,audio")
         return
     
     elif data == "ocr":
         await ocr_cmd(update, context)
-        return
+        return WAIT_OCR_PHOTO
     
     elif data == "tts":
-        await update.effective_message.reply_text("🎙️ أرسل النص المراد تحويله إلى صوت:")
+        await q.message.reply_text("🎙️ أرسل النص المراد تحويله إلى صوت:")
         return WAIT_TTS_TEXT
     
     # ====== الأزرار الأخرى ======
@@ -586,7 +586,7 @@ def main():
         allow_reentry=True,
     )
     conv_ocr = ConversationHandler(
-        entry_points=[CommandHandler("ocr", ocr_cmd)],
+        entry_points=[CommandHandler("ocr", ocr_cmd), CallbackQueryHandler(button_handler, pattern="^ocr$")],
         states={WAIT_OCR_PHOTO: [MessageHandler(filters.PHOTO, receive_ocr_photo)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -628,21 +628,9 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(earnings_job, interval=1800, first=60)
 
-    # تشغيل البوت
-    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
-    if WEBHOOK_URL:
-        if not WEBHOOK_URL.startswith("https://"):
-            print("⚠️ WEBHOOK_URL يجب أن يبدأ بـ https://")
-        else:
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=int(os.environ.get("PORT", 8443)),
-                url_path="webhook",
-                webhook_url=f"{WEBHOOK_URL}/webhook"
-            )
-    else:
-        print("✅ البوت يعمل (Polling)...")
-        app.run_polling()
+    # تشغيل البوت - Polling فقط
+    print("✅ البوت يعمل (Polling)...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
